@@ -18,6 +18,6 @@
 // K cv
 
 #define READ_BATCH_SIZE 10000
-
+#define WRITE_BATCH_SIZE 74
 
 #endif //LAB1_CONST_H

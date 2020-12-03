@@ -4,7 +4,13 @@
 #include <fcntl.h>
 #include <unistd.h>
 #include <pthread.h>
+#include <semaphore.h>
 #include "const.h"
+
+struct timespec start;
+struct timespec finish;
+double elapsed;
+static sem_t file_sync;
 
 struct write_to_memory_args {
     int    fd;
@@ -13,6 +19,14 @@ struct write_to_memory_args {
     char   *allocated_memory;
     pthread_t pthread;
     char *bytes;
+};
+
+struct write_to_files_args {
+    int files_amount;
+    size_t file_batch_size_bytes;
+    size_t file_batch_size_bytes_remained;
+    char *allocated_memory;
+    int *fds;
 };
 
 void read_from_fd(int fd, char *chars_from_random_array) {
@@ -75,15 +89,66 @@ void open_files(int files_amount, int* fds) {
     }
 }
 
-struct timespec start;
-struct timespec finish;
-double elapsed;
+void write_to_file(const char *allocated_memory, int fd, int file_number, size_t bytes_count) {
+    char io_block[WRITE_BATCH_SIZE];
+    int io_block_byte = 0;
+    size_t bytes_written;
+    for (size_t i = file_number * E; i < file_number * E + bytes_count; i++) {
+        io_block[io_block_byte] = allocated_memory[i];
+        io_block_byte += 1;
+        if (io_block_byte >= WRITE_BATCH_SIZE) {
+            io_block_byte = 0;
+            bytes_written = write(fd, &io_block, WRITE_BATCH_SIZE);
+            if (bytes_written == -1) {
+                perror("can't write to file");
+                exit(EXIT_FAILURE);
+            }
+        }
+        if (io_block_byte > 0) {
+            bytes_written = write(fd, &io_block, WRITE_BATCH_SIZE - io_block_byte);
+            if (bytes_written == -1) {
+                perror("can't write to file");
+                exit(EXIT_FAILURE);
+            }
+        }
+    }
+}
+
+_Noreturn void* write_to_files(void* args) {
+    printf("%s", "Started writing\n");
+    struct write_to_files_args* write_to_files_args = (struct write_to_files_args*) args;
+    while (1) {
+        sem_wait(&file_sync);
+        printf("%s", "Locked on write\n");
+        for (int i = 0; i < write_to_files_args->files_amount; i++) {
+            if (write_to_files_args->file_batch_size_bytes_remained != 0 &&
+            i == write_to_files_args->files_amount - 1){
+                write_to_file(write_to_files_args->allocated_memory,
+                                    write_to_files_args->fds[i],
+                                    i,
+                                    write_to_files_args->file_batch_size_bytes_remained);
+            } else {
+               write_to_file(write_to_files_args->allocated_memory,
+                             write_to_files_args->fds[i],
+                             i,
+                             write_to_files_args->file_batch_size_bytes);
+            }
+        }
+        sem_post(&file_sync);
+        printf("%s", "Unlocked on write\n");
+    }
+}
 
 int main()
 {
     const size_t size_in_bytes = ((A)*pow(1000, 2));
 
     void *allocated_memory = (void *)malloc(size_in_bytes);
+
+    if(sem_init(&file_sync, 0, 1) < 0){
+        perror("could not initialize a semaphore");
+        exit(EXIT_FAILURE);
+    }
 
     int urandom_fd = open("/dev/urandom", O_RDONLY);
     if (urandom_fd < 0) {
@@ -137,13 +202,13 @@ int main()
 
     clock_gettime(CLOCK_MONOTONIC, &finish);
 
-    elapsed = (finish.tv_sec - start.tv_sec);
-    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+    elapsed = (double)(finish.tv_sec - start.tv_sec);
+    elapsed += (double)(finish.tv_nsec - start.tv_nsec) / 1000000000.0;
 
     printf("Filling up the memory took: %f seconds\n", elapsed);
 
 
-    char *ptr = (char *) allocated_memory;
+//    char *ptr = (char *) allocated_memory;
 
 //    for (size_t i = 0; i < size_in_bytes; i++) {
 //        printf(" %d ", ptr[i]);
@@ -153,14 +218,22 @@ int main()
 //    }
 //    printf("\n -------- -------- ------- \n");
 
-    printf("\n -------- -------- ------- \n %d "
-           "\n %d \n -------- -------- ------- \n", ptr[0], ptr[size_in_bytes-1]);
+//    printf("\n -------- -------- ------- \n %d "
+//           "\n %d \n -------- -------- ------- \n", ptr[0], ptr[size_in_bytes-1]);
 
     int files_amount = ( A / E ) + 1;
     int *file_descriptors = malloc(sizeof(int) * files_amount);
 
     clean_files(files_amount);
     open_files(files_amount, file_descriptors);
+
+    struct write_to_files_args *to_file_args = malloc(sizeof(struct write_to_files_args));
+
+    to_file_args->file_batch_size_bytes             = size_in_bytes / files_amount;
+    to_file_args->file_batch_size_bytes_remained    = size_in_bytes % files_amount;
+    to_file_args->files_amount                      = files_amount;
+    to_file_args->fds                               = file_descriptors;
+    to_file_args->allocated_memory                  = allocated_memory;
 
     // close files
     if(close(urandom_fd) < 0) {
