@@ -16,17 +16,21 @@ struct write_to_memory_args {
     int    fd;
     size_t start;
     size_t end;
-    char   *allocated_memory;
+    unsigned char *allocated_memory;
     pthread_t pthread;
-    char *bytes;
+    unsigned char *bytes;
 };
 
 struct write_to_files_args {
     int files_amount;
     size_t file_batch_size_bytes;
     size_t file_batch_size_bytes_remained;
-    char *allocated_memory;
+    unsigned char *allocated_memory;
     int *fds;
+};
+
+struct ReadFromFileArgs {
+    int fd;
 };
 
 void read_from_fd(int fd, char *chars_from_random_array) {
@@ -77,9 +81,9 @@ void clean_files(int files_amount) {
 }
 
 void open_files(int files_amount, int* fds) {
-    char filename[10];
+    char filename[5];
     for (int i = 0; i < files_amount; ++i) {
-        sprintf(filename, "file%d.txt", i);
+        sprintf(filename, "%d", i);
         fds[i] = open(filename, O_RDWR + O_CREAT, S_IWUSR + S_IRUSR);
         posix_fadvise(fds[i], 0, 0, POSIX_FADV_DONTNEED);
         if (fds[i] == -1) {
@@ -89,10 +93,11 @@ void open_files(int files_amount, int* fds) {
     }
 }
 
-void write_to_file(const char *allocated_memory, int fd, int file_number, size_t bytes_count) {
-    char io_block[WRITE_BATCH_SIZE];
+void write_to_file(unsigned char *allocated_memory, int fd, int file_number, size_t bytes_count) {
+    unsigned char io_block[WRITE_BATCH_SIZE];
     int io_block_byte = 0;
     size_t bytes_written;
+    int totalBytesWrittenToFile = 0;
     for (size_t i = file_number * E; i < file_number * E + bytes_count; i++) {
         io_block[io_block_byte] = allocated_memory[i];
         io_block_byte += 1;
@@ -103,6 +108,7 @@ void write_to_file(const char *allocated_memory, int fd, int file_number, size_t
                 perror("can't write to file");
                 exit(EXIT_FAILURE);
             }
+            totalBytesWrittenToFile += bytes_written;
         }
         if (io_block_byte > 0) {
             bytes_written = write(fd, &io_block, WRITE_BATCH_SIZE - io_block_byte);
@@ -110,8 +116,10 @@ void write_to_file(const char *allocated_memory, int fd, int file_number, size_t
                 perror("can't write to file");
                 exit(EXIT_FAILURE);
             }
+            totalBytesWrittenToFile += bytes_written;
         }
     }
+    printf("Total bytes written to file: %d\n", totalBytesWrittenToFile);
 }
 
 _Noreturn void* write_to_files(void* args) {
@@ -139,6 +147,46 @@ _Noreturn void* write_to_files(void* args) {
     }
 }
 
+void* ReadFile(void* args) {
+    size_t totalBytesRead;
+    unsigned char max;
+    struct ReadFromFileArgs* fileArgs = (struct ReadFromFileArgs*) args;
+    unsigned char readBlock[WRITE_BATCH_SIZE];
+    int readBytes;
+    printf("Started read from file thread\n");
+    sem_wait(&file_sync);
+    printf("Locked on read\n");
+    if (lseek(fileArgs->fd, 0, SEEK_SET) == -1) {
+        return NULL;
+    }
+    while (1) {
+        readBytes = read(fileArgs->fd, &readBlock, WRITE_BATCH_SIZE);
+        if (readBytes == -1) {
+            perror("Error reading from file");
+            break;
+        }
+
+        totalBytesRead += readBytes;
+        if (readBytes < WRITE_BATCH_SIZE) {
+            if (readBytes == 0) {
+                printf("Zero\n");
+                break;
+            }
+        } else {
+            for (int i = 0; i < WRITE_BATCH_SIZE; i++) {
+                if (readBlock[i] > max) {
+                    max = readBlock[i];
+                }
+            }
+        }
+    }
+    sem_post(&file_sync);
+    printf("Unlocked on read\n");
+    sleep(1);
+
+    return NULL;
+}
+
 int main()
 {
     const size_t size_in_bytes = ((A)*pow(1000, 2));
@@ -150,6 +198,9 @@ int main()
         exit(EXIT_FAILURE);
     }
 
+    pthread_t write_to_files_thread_id;
+
+
     int urandom_fd = open("/dev/urandom", O_RDONLY);
     if (urandom_fd < 0) {
         perror("could not open file descriptor");
@@ -157,7 +208,7 @@ int main()
     }
 
 //    char bytes[READ_BATCH_SIZE];
-    char bytes_arr[D][READ_BATCH_SIZE];
+    unsigned char bytes_arr[D][READ_BATCH_SIZE];
 
 
 //    if(number_of_read_bytes == size_in_bytes)
@@ -234,6 +285,41 @@ int main()
     to_file_args->files_amount                      = files_amount;
     to_file_args->fds                               = file_descriptors;
     to_file_args->allocated_memory                  = allocated_memory;
+
+    if (pthread_create(&write_to_files_thread_id, NULL, write_to_files, to_file_args)){
+        free(to_file_args);
+        perror("Can't create write to files thread");
+    }
+
+    pthread_t readFromFileThreads[I];
+
+    int fileIndex = 0;
+
+    clock_gettime(CLOCK_MONOTONIC, &start);
+
+    for (size_t i = 0; i < I; i++) {
+        struct ReadFromFileArgs* fileArgs = malloc(sizeof(struct ReadFromFileArgs));
+        if (fileIndex >= files_amount) fileIndex = 0;
+        fileArgs->fd = file_descriptors[fileIndex];
+        fileIndex += 1;
+        if (pthread_create(&readFromFileThreads[i], NULL, ReadFile, (void*) fileArgs)) {
+            free(fileArgs);
+            perror("Can't create thread");
+        }
+    }
+
+    for (int i = 0; i < I; i++) {
+        pthread_join(readFromFileThreads[i], NULL);
+    }
+
+    clock_gettime(CLOCK_MONOTONIC, &finish);
+
+    elapsed = (finish.tv_sec - start.tv_sec);
+    elapsed += (finish.tv_nsec - start.tv_nsec) / 1000000000.0;
+
+    printf("Reading from files: %f seconds\n", elapsed);
+
+    pthread_cancel(write_to_files_thread_id);
 
     // close files
     if(close(urandom_fd) < 0) {
